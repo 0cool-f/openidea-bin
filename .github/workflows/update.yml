@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: 0BSD
+# Pulls the package files from the AUR, which other maintainers also push to, then moves the
+# package to upstream's latest stable release, or else rebuilds it and fixes a .SRCINFO that does
+# not match the PKGBUILD, and publishes any change to the AUR and to main.
+name: update
+
+on:
+  schedule:
+    - cron: "23 */3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: aur
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    environment: aur
+    permissions:
+      contents: write
+    env:
+      BOT_NAME: github-actions[bot]
+      BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+      - name: Set up SSH for the AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          grep -v '^#' ci/known_hosts > ~/.ssh/known_hosts
+          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile ~/.ssh/aur\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n' > ~/.ssh/config
+      - name: Pull the package files from the AUR
+        run: |
+          ci/aur.sh pull
+          if ! git diff --quiet; then
+            git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" commit -qam "Sync from the AUR"
+            git push origin HEAD:main
+          fi
+      - name: Find a newer upstream release
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api repos/l0ng-ai/openidea/releases/latest --jq .tag_name)
+          latest=${tag#v}
+          current=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          if [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)" = "$current" ]; then
+            echo "openidea $current is up to date"
+            exit 0
+          fi
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+      - name: Update, build and publish
+        if: steps.latest.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          ci/update.sh "$VERSION"
+          git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" commit -qam "Update to $VERSION-1"
+          ci/aur.sh push
+          git push origin HEAD:main
+      - name: Build, and fix and publish a stale .SRCINFO
+        if: steps.latest.outputs.version == ''
+        run: |
+          ci/check.sh --write-srcinfo
+          if ! git diff --quiet; then
+            git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" commit -qam "Regenerate .SRCINFO from PKGBUILD"
+            ci/aur.sh push
+            git push origin HEAD:main
+          fi

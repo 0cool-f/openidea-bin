@@ -3,3 +3,4 @@ OpenIDEA-*.rpm
 *.pkg.tar.zst
 pkg/
 src/
+build/
